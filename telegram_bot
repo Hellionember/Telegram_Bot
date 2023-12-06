@@ -1,0 +1,210 @@
+# Импортируем необходимые библиотеки
+import aiogram
+from aiogram import Bot, Dispatcher, executor, types
+import asyncpg
+from aiogram.types import ParseMode
+from aiogram.dispatcher.filters import Command
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+
+
+# Инициализация соединения с базой данных
+DATABASE_URL = "postgresql://postgres:Uncharted4@localhost:5432/Telegram_Bot_1"
+
+API_TOKEN = "6851473090:AAHNAg4BvidLY1VQbzWUk8A3OHnV2FzFx8I"
+
+# Инициализация бота и диспетчера с использованием MemoryStorage
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+
+async def on_startup(dp):
+    await bot.send_message(chat_id="705858668", text='Бот запущен /start')
+
+    # Устанавливаем соединение с базой данных
+    dp['db_pool'] = await asyncpg.create_pool(DATABASE_URL)
+
+
+class ClientStates(StatesGroup):
+    WaitingForDescription = State()
+    WaitingForWeight = State()
+    WaitingForDimensions = State()
+    WaitingForPickupAddress = State()
+    WaitingForDeliveryAddress = State()
+    WaitingForPaymentMethod = State()
+    AllSteps = [
+        WaitingForDescription,
+        WaitingForWeight,
+        WaitingForDimensions,
+        WaitingForPickupAddress,
+        WaitingForDeliveryAddress,
+        WaitingForPaymentMethod,
+    ]
+
+
+# Команда /start
+@dp.message_handler(Command("start"))
+async def cmd_start(message: types.Message):
+    await bot.send_message(message.from_user.id,
+                           "Привет! Я бот логистической компании. Чтобы создать накладную, используй команду /create_waybill. "
+                           "Если вы еще не зарегистрированы, используйте команду /register для регистрации.")
+
+
+# Команда /register
+@dp.message_handler(Command("register"))
+async def register_user(message: types.Message):
+    async with dp['db_pool'].acquire() as connection:
+        # Проверяем, зарегистрирован ли пользователь
+        client = await connection.fetchrow("SELECT * FROM clients WHERE telegram_user_id = $1", message.from_user.id)
+        if client:
+            await message.answer("Вы уже зарегистрированы.")
+        else:
+            # Запрашиваем номер телефона у пользователя
+            keyboard = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+            button = KeyboardButton(text="Поделиться номером телефона", request_contact=True)
+            keyboard.add(button)
+
+            await message.answer("Для регистрации поделитесь вашим номером телефона.", reply_markup=keyboard)
+
+            # Обработчик контакта
+            @dp.message_handler(content_types=types.ContentType.CONTACT)
+            async def process_contact(message: types.Message):
+                # Получаем номер телефона
+                phone_number = message.contact.phone_number
+
+                # Регистрируем нового пользователя
+                async with dp['db_pool'].acquire() as connection:
+                    username = message.from_user.username or 'Unknown'  # Значение по умолчанию, если username не указан
+                    await connection.execute(
+                        "INSERT INTO clients (telegram_user_id, name, phone_number) VALUES ($1, $2, $3)",
+                        message.from_user.id, username, phone_number
+                    )
+
+                    await message.answer("Регистрация успешна! Теперь вы можете создать накладную командой /create_waybill.",
+                                         reply_markup=ReplyKeyboardRemove())
+
+
+# Обработчик команды создания накладной
+@dp.message_handler(Command("create_waybill"))
+async def create_waybill_step1(message: types.Message, state: FSMContext):
+    await state.finish()
+    await ClientStates.WaitingForDescription.set()
+    await bot.send_message(message.from_user.id, "Шаг 1. Введите описание груза:")
+
+
+@dp.message_handler(state=ClientStates.WaitingForDescription)
+async def create_waybill_step2(message: types.Message, state: FSMContext):
+    try:
+        description = message.text
+        await state.update_data(description=description)
+        await bot.send_message(message.from_user.id, "Шаг 2. Введите вес груза:")
+        await ClientStates.WaitingForWeight.set()
+    except ValueError:
+        await bot.send_message(message.from_user.id, "Пожалуйста, введите корректное описание груза.")
+
+
+@dp.message_handler(state=ClientStates.WaitingForWeight)
+async def create_waybill_step3(message: types.Message, state: FSMContext):
+    try:
+        weight = float(message.text)
+        await state.update_data(weight=weight)
+        await bot.send_message(message.from_user.id, "Шаг 3. Введите габариты груза:")
+        await ClientStates.WaitingForDimensions.set()
+    except ValueError:
+        await bot.send_message(message.from_user.id, "Пожалуйста, введите корректный вес груза.")
+
+
+@dp.message_handler(state=ClientStates.WaitingForDimensions)
+async def create_waybill_step4(message: types.Message, state: FSMContext):
+    dimensions = message.text
+    await state.update_data(dimensions=dimensions)
+    await bot.send_message(message.from_user.id, "Шаг 4. Введите точный адрес отправки:")
+    await ClientStates.WaitingForPickupAddress.set()
+
+
+@dp.message_handler(state=ClientStates.WaitingForPickupAddress)
+async def create_waybill_step5(message: types.Message, state: FSMContext):
+    pickup_address = message.text
+    await state.update_data(pickup_address=pickup_address)
+    await bot.send_message(message.from_user.id, "Шаг 5. Введите точный адрес получения:")
+    await ClientStates.WaitingForDeliveryAddress.set()
+
+
+@dp.message_handler(state=ClientStates.WaitingForDeliveryAddress)
+async def create_waybill_step6(message: types.Message, state: FSMContext):
+    delivery_address = message.text
+    await state.update_data(delivery_address=delivery_address)
+    await bot.send_message(message.from_user.id, "Шаг 6. Введите способ оплаты:")
+    await ClientStates.WaitingForPaymentMethod.set()
+
+@dp.message_handler(state=ClientStates.WaitingForPaymentMethod)
+async def create_waybill_step7(message: types.Message, state: FSMContext):
+    payment_method = message.text
+    await state.update_data(payment_method=payment_method)
+
+    # Остальной код для завершения создания накладной
+    await create_waybill_finish(message, state)
+
+async def save_waybill_to_database(waybill_data):
+    try:
+        # Подключаемся к базе данных
+        connection = await asyncpg.connect(DATABASE_URL)
+
+        print("Trying to save to database:", waybill_data)
+
+        # Выполняем SQL-запрос для вставки данных в таблицу
+        await connection.execute("""
+            INSERT INTO waybills (description, weight, dimensions, pickup_address, delivery_address, payment_method)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """, waybill_data['description'], waybill_data['weight'], waybill_data['dimensions'],
+                                 waybill_data['pickup_address'], waybill_data['delivery_address'],
+                                 waybill_data['payment_method'])
+
+        print("Saved to database successfully")
+
+    except Exception as e:
+        print(f"Error saving waybill to database: {e}")
+
+    finally:
+        # Закрываем соединение
+        await connection.close()
+
+
+# Обработчик для завершения создания накладной
+@dp.message_handler(state=ClientStates.AllSteps)
+async def create_waybill_finish(message: types.Message, state: FSMContext):
+    try:
+        async with state.proxy() as data:
+            # Получаем все данные из state.proxy()
+            waybill_data = {
+                'description': data['description'],
+                'weight': float(data['weight']),
+                'dimensions': data['dimensions'],
+                'pickup_address': data['pickup_address'],
+                'delivery_address': data['delivery_address'],
+            }
+
+            # Сохраняем данные в базе данных
+            await save_waybill_to_database(waybill_data)
+
+            # Очищаем данные в state.proxy() после успешного завершения
+            data.clear()
+
+            await bot.send_message(message.from_user.id,
+                                   "Накладная успешно создана! Данные сохранены в базе данных.")
+    except Exception as e:
+        error_message = f"An error occurred in create_waybill_finish: {e}"
+        print(error_message)
+        await bot.send_message(message.from_user.id,
+                               f"Произошла ошибка при завершении создания накладной. Попробуйте снова. \n{error_message}")
+
+
+# Запуск бота
+if __name__ == "__main__":
+    from aiogram import executor
+
+    # Запускаем бота с передачей функции on_startup
+    executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
